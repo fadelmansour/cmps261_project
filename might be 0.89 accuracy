@@ -1,0 +1,100 @@
+# Install necessary libraries
+!pip install -q -U transformers datasets accelerate imbalanced-learn
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
+from imblearn.over_sampling import RandomOverSampler
+import torch
+from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification, Trainer, TrainingArguments
+from datasets import Dataset
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"✅ Using device: {device}")
+
+# Load and prepare data
+df = pd.read_csv("Sentiment_analysis_dataset.csv")
+df = df.dropna(subset=["Statement", "Status"])
+df = df[df["Statement"].str.strip().astype(bool)].reset_index(drop=True)
+
+# Encode labels
+label2id = {label: i for i, label in enumerate(sorted(df["Status"].unique()))}
+id2label = {i: label for label, i in label2id.items()}
+df["label"] = df["Status"].map(label2id)
+
+# Oversample to ensure balanced classes
+ros = RandomOverSampler(random_state=42)
+X_resampled, y_resampled = ros.fit_resample(df[["Statement"]], df["label"])
+df_balanced = pd.DataFrame({"Statement": X_resampled["Statement"], "label": y_resampled})
+
+# Train/test split
+train_df, test_df = train_test_split(df_balanced[["Statement", "label"]], stratify=df_balanced["label"], test_size=0.2, random_state=42)
+
+# HuggingFace Dataset
+train_ds = Dataset.from_pandas(train_df)
+test_ds = Dataset.from_pandas(test_df)
+
+# Tokenizer
+tokenizer = DistilBertTokenizerFast.from_pretrained("distilbert-base-uncased")
+
+def tokenize(batch):
+    return tokenizer(batch["Statement"], truncation=True, padding="max_length", max_length=128)
+
+train_ds = train_ds.map(tokenize, batched=True)
+test_ds = test_ds.map(tokenize, batched=True)
+
+train_ds.set_format("torch", columns=["input_ids", "attention_mask", "label"])
+test_ds.set_format("torch", columns=["input_ids", "attention_mask", "label"])
+
+# Model
+model = DistilBertForSequenceClassification.from_pretrained(
+    "distilbert-base-uncased",
+    num_labels=len(label2id),
+    id2label=id2label,
+    label2id=label2id
+).to(device)
+
+# TrainingArguments for maximum performance
+training_args = TrainingArguments(
+    output_dir="./results",
+    per_device_train_batch_size=32,  # Increased batch size for faster training
+    per_device_eval_batch_size=64,
+    num_train_epochs=5,  # More epochs to improve accuracy
+    evaluation_strategy="epoch",  # Evaluate after every epoch
+    logging_steps=10,
+    save_strategy="epoch",  # Save model after each epoch
+    report_to="none",  # Disable reporting to avoid unnecessary logging
+    learning_rate=2e-5,  # A proven learning rate for fine-tuning
+    warmup_steps=100,  # Gradual learning rate increase for stability
+    fp16=True if torch.cuda.is_available() else False,  # Use mixed precision for faster training
+    load_best_model_at_end=True  # Ensure the best model is loaded
+)
+
+# Metrics
+def compute_metrics(p):
+    preds = np.argmax(p.predictions, axis=1)
+    return {"accuracy": accuracy_score(p.label_ids, preds)}
+
+# Trainer setup
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    eval_dataset=test_ds,
+    compute_metrics=compute_metrics
+)
+
+# Train the model
+trainer.train()
+
+# Evaluate the model
+preds = trainer.predict(test_ds)
+final_preds = np.argmax(preds.predictions, axis=1)
+
+# Final report
+print("\n✅ Final Classification Report:")
+print(classification_report(test_ds["label"], final_preds, target_names=label2id.keys()))
+print(f"✅ Accuracy: {accuracy_score(test_ds['label'], final_preds):.4f}")
+
