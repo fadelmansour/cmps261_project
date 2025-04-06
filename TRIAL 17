@@ -1,0 +1,119 @@
+# Install necessary libraries
+!pip install -q -U transformers datasets accelerate imbalanced-learn
+!pip install torch torchvision torchaudio  # Install PyTorch if needed
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from imblearn.over_sampling import RandomOverSampler
+import torch
+from transformers import BertTokenizerFast, BertForSequenceClassification, Trainer, TrainingArguments, get_scheduler
+from datasets import Dataset
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Check if CUDA (GPU) is available
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Device being used: {device}")
+
+# Load and clean data
+df = pd.read_csv("Sentiment_analysis_dataset.csv")
+df = df.dropna(subset=['Statement', 'Status'])
+df = df[df['Statement'].str.strip().astype(bool)].reset_index(drop=True)
+
+# Encode labels
+label2id = {label: i for i, label in enumerate(sorted(df['Status'].unique()))}
+id2label = {i: label for label, i in label2id.items()}
+df['label'] = df['Status'].map(label2id)
+
+# Split data
+train_df, test_df = train_test_split(df[['Statement', 'label']], stratify=df['label'], test_size=0.2, random_state=42)
+
+# Oversample to balance
+ros = RandomOverSampler(random_state=42)
+X_resampled, y_resampled = ros.fit_resample(train_df[['Statement']], train_df['label'])
+train_df_balanced = pd.DataFrame({'Statement': X_resampled['Statement'], 'label': y_resampled})
+
+# HuggingFace Dataset
+train_ds = Dataset.from_pandas(train_df_balanced)
+test_ds = Dataset.from_pandas(test_df)
+
+# Tokenizer with increased max_length for more context
+tokenizer = BertTokenizerFast.from_pretrained('bert-large-uncased')  # Switched to BERT-large
+
+# Tokenization function with increased max_length
+def tokenize(batch):
+    return tokenizer(batch['Statement'], truncation=True, padding='max_length', max_length=256)  # Increased max_length
+
+# Map tokenization to both datasets
+train_ds = train_ds.map(tokenize, batched=True)
+test_ds = test_ds.map(tokenize, batched=True)
+
+# Ensure both train and test sets have the necessary columns for PyTorch
+train_ds.set_format('torch', columns=['input_ids', 'attention_mask', 'label'])
+test_ds.set_format('torch', columns=['input_ids', 'attention_mask', 'label'])
+
+# Model
+model = BertForSequenceClassification.from_pretrained(
+    'bert-large-uncased',  # Switched to BERT-large
+    num_labels=len(label2id),
+    id2label=id2label,
+    label2id=label2id
+)
+
+# Simplified TrainingArguments with additional settings
+training_args = TrainingArguments(
+    output_dir='./results',
+    num_train_epochs=5,  # Increased epochs for better training
+    per_device_train_batch_size=8,  # Batch size for training
+    per_device_eval_batch_size=16,  # Batch size for evaluation
+    logging_dir='./logs',
+    logging_steps=10,
+    evaluation_strategy="epoch",  # Evaluate at the end of each epoch
+    report_to='none',
+    no_cuda=False,
+    max_steps=1000,
+    weight_decay=0.01,  # Added weight decay to avoid overfitting
+    learning_rate=2e-5,  # Fine-tuned learning rate
+    lr_scheduler_type="linear",  # Using linear scheduler
+)
+
+# Compute metrics function
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=1)
+    acc = accuracy_score(labels, preds)
+    return {"accuracy": acc}
+
+# Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    eval_dataset=test_ds,
+    compute_metrics=compute_metrics,
+)
+
+# Move model to the correct device (GPU/CPU)
+model.to(device)
+
+# Train the model
+trainer.train()
+
+# Evaluate the model
+preds = trainer.predict(test_ds)
+pred_labels = np.argmax(preds.predictions, axis=1)
+
+# Print classification report and accuracy
+print(classification_report(test_ds['label'], pred_labels, target_names=list(label2id.keys())))
+print(f"✅ Accuracy: {accuracy_score(test_ds['label'], pred_labels):.4f}")
+
+# Confusion Matrix
+cm = confusion_matrix(test_ds['label'], pred_labels)
+plt.figure(figsize=(8,6))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=label2id.keys(), yticklabels=label2id.keys())
+plt.title("Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.show()
