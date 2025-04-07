@@ -1,0 +1,10 @@
+test_texts = [
+    "I can't stop worrying about everything, even the smallest things.",               # Anxiety
+    "Sometimes I feel like there's no point in anything I do.",                        # Depression
+    "Life is good, and I'm feeling pretty optimistic today.",                          # Normal
+    "No one cares if I'm alive or not, and I don’t want to keep going.",               # Suicidal
+    "I experience extreme highs and lows, and I can't control them.",                  # Bipolar
+    "I feel like everyone is out to get me, even my friends and family.",              # Personality disorder
+    "There’s too much going on at work, I can barely breathe from all the pressure.",  # Stress
+    "I'm just chilling today, nothing special is going on."                            # Normal
+]
