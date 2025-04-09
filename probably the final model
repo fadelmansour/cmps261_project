@@ -1,0 +1,202 @@
+#=== 0. Install Required Libraries ===
+# Uncomment if running in Colab or fresh environment:
+# !pip install -q transformers datasets accelerate scikit-learn matplotlib
+!pip install -q datasets
+
+import pandas as pd
+import numpy as np
+import torch
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.utils.class_weight import compute_class_weight
+from transformers import RobertaTokenizerFast, RobertaConfig, AutoConfig, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from datasets import Dataset
+import matplotlib.pyplot as plt
+
+# === 1. Set device ===
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"✅ Using device: {device}")
+
+# === 2. Load and clean data ===
+df = pd.read_csv("Sentiment_analysis_dataset.csv")
+df = df.dropna(subset=["Statement", "Status"])
+df = df[df["Statement"].str.strip().astype(bool)].reset_index(drop=True)
+
+# === 3. Encode labels ===
+label2id = {label: i for i, label in enumerate(sorted(df["Status"].unique()))}
+id2label = {i: label for label, i in label2id.items()}
+df["label"] = df["Status"].map(label2id)
+
+# === 4. Train/test split ===
+train_df, test_df = train_test_split(
+    df[["Statement", "label"]],
+    stratify=df["label"],
+    test_size=0.2,
+    random_state=42
+)
+
+# === 5. Compute class weights ===
+class_weights = compute_class_weight('balanced', classes=np.unique(train_df["label"]), y=train_df["label"])
+class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+
+# === 6. Convert to HuggingFace Dataset ===
+train_ds = Dataset.from_pandas(train_df)
+test_ds = Dataset.from_pandas(test_df)
+
+# === 7. Tokenize ===
+tokenizer = RobertaTokenizerFast.from_pretrained("roberta-base")
+
+def tokenize(batch):
+    return tokenizer(batch["Statement"], truncation=True, padding="max_length", max_length=128)
+
+train_ds = train_ds.map(tokenize, batched=True)
+test_ds = test_ds.map(tokenize, batched=True)
+
+train_ds.set_format("torch", columns=["input_ids", "attention_mask", "label"])
+test_ds.set_format("torch", columns=["input_ids", "attention_mask", "label"])
+
+# === 8. Custom Roberta Model with Weighted Loss ===
+class RobertaWithWeightedLoss(AutoModelForSequenceClassification):
+    def __init__(self, config, class_weights=None):
+        super().__init__(config)
+        self.class_weights = class_weights
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        logits = outputs.logits
+        if labels is not None:
+            loss_fct = torch.nn.CrossEntropyLoss(weight=self.class_weights)
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            return {"loss": loss, "logits": logits}
+        return {"logits": logits}
+
+# === 9. Custom Trainer to strip unwanted kwargs ===
+class CustomTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # Remove any unwanted keys like 'num_items_in_batch'
+        inputs = {k: v for k, v in inputs.items() if k in ['input_ids', 'attention_mask', 'labels']}
+        outputs = model(**inputs)
+        loss = outputs["loss"]
+        return (loss, outputs) if return_outputs else loss
+
+# === 10. Load Config & Model ===
+config = AutoConfig.from_pretrained("roberta-base", num_labels=len(label2id), id2label=id2label, label2id=label2id)
+model = RobertaWithWeightedLoss.from_pretrained("roberta-base", config=config)
+
+# Pass the class weights after loading the model
+model.class_weights = class_weights.to(device)  # Move to the appropriate device
+model = model.to(device)  # Ensure the model is on the correct device
+
+# === 11. Training Arguments ===
+training_args = TrainingArguments(
+    output_dir="./results",
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=64,
+    num_train_epochs=5,
+    eval_strategy="epoch",
+    logging_steps=10,
+    save_strategy="epoch",
+    report_to="none",
+    learning_rate=2e-5,
+    warmup_steps=100,
+    fp16=torch.cuda.is_available(),
+    load_best_model_at_end=True,
+    metric_for_best_model="accuracy"
+)
+
+# === 12. Accuracy Metric ===
+def compute_metrics(p):
+    preds = np.argmax(p.predictions, axis=1)
+    return {"accuracy": accuracy_score(p.label_ids, preds)}
+
+# === 13. Train the Model ===
+trainer = CustomTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    eval_dataset=test_ds,
+    compute_metrics=compute_metrics
+)
+
+print("🚀 Starting training...")
+trainer.train()
+print("🎉 Training completed!")
+
+# === 14. Evaluate ===
+print("\n🧪 Evaluating model...")
+preds = trainer.predict(test_ds)
+final_preds = np.argmax(preds.predictions, axis=1)
+
+print("\n✅ Final Classification Report:")
+print(classification_report(test_ds["label"], final_preds, target_names=list(label2id.keys())))
+print(f"✅ Accuracy: {accuracy_score(test_ds['label'], final_preds):.4f}")
+
+# === 15. Confusion Matrix ===
+cm = confusion_matrix(test_df["label"], final_preds)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=list(label2id.keys()))
+disp.plot(xticks_rotation=45)
+plt.title("Confusion Matrix")
+plt.show()
+
+# === 16. Plot Loss and Accuracy ===
+training_logs = trainer.state.log_history
+train_loss, train_steps = [], []
+eval_loss, eval_accuracy, eval_epochs = [], [], []
+
+for log in training_logs:
+    if "loss" in log and "epoch" in log:
+        train_loss.append(log["loss"])
+        train_steps.append(log["step"])
+    if "eval_loss" in log and "epoch" in log:
+        eval_loss.append(log["eval_loss"])
+        eval_accuracy.append(log["eval_accuracy"])
+        eval_epochs.append(log["epoch"])
+
+plt.figure(figsize=(10, 5))
+plt.plot(train_steps, train_loss, label="Training Loss", marker="o", alpha=0.6)
+plt.plot(eval_epochs, eval_loss, label="Validation Loss", marker="o", color="orange")
+plt.title("Training vs Validation Loss")
+plt.xlabel("Steps / Epochs")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(10, 5))
+plt.plot(eval_epochs, eval_accuracy, label="Validation Accuracy", color="green", marker="o")
+plt.title("Validation Accuracy per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# === 17. Predict Function ===
+def predict_statements(texts):
+    model.eval()
+    tokens = tokenizer(texts, padding=True, truncation=True, max_length=128, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**tokens)
+        probs = torch.nn.functional.softmax(outputs["logits"], dim=1)
+        preds = torch.argmax(probs, dim=1).cpu().numpy()
+        confidences = torch.max(probs, dim=1).values.cpu().numpy()
+
+    for text, pred, conf in zip(texts, preds, confidences):
+        status = id2label[pred]
+        print(f"\n📝 Statement: {text}")
+        print(f"🔍 Predicted Status: {status} (Confidence: {conf:.2f})")
+
+# === 18. Test Sample Statements ===
+test_texts = [
+    "I can't stop worrying about everything, even the smallest things.",
+    "Sometimes I feel like there's no point in anything I do.",
+    "Life is good, and I'm feeling pretty optimistic today.",
+    "No one cares if I'm alive or not, and I don’t want to keep going.",
+    "I experience extreme highs and lows, and I can't control them.",
+    "I feel like everyone is out to get me, even my friends and family.",
+    "There’s too much going on at work, I can barely breathe from all the pressure.",
+    "I'm just chilling today, nothing special is going on."
+]
+
+print("\n🧠 Testing sample statements...")
+predict_statements(test_texts)
