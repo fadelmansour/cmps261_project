@@ -24,13 +24,14 @@ label2id = {label: i for i, label in enumerate(sorted(df["Status"].unique()))}
 id2label = {i: label for label, i in label2id.items()}
 df["label"] = df["Status"].map(label2id)
 
-# Train/test split
-train_df, test_df = train_test_split(df[["Statement", "label"]], stratify=df["label"], test_size=0.2, random_state=42)
-
 # Oversample
 ros = RandomOverSampler(random_state=42)
 X_resampled, y_resampled = ros.fit_resample(train_df[["Statement"]], train_df["label"])
 train_df_bal = pd.DataFrame({"Statement": X_resampled["Statement"], "label": y_resampled})
+# Train/test split
+train_df, test_df = train_test_split(df[["Statement", "label"]], stratify=df["label"], test_size=0.2, random_state=42)
+
+
 
 # HuggingFace Dataset
 train_ds = Dataset.from_pandas(train_df_bal)
